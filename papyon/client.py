@@ -102,7 +102,7 @@ import logging
 
 __all__ = ['Client']
 
-logger = logging.getLogger('client')
+logger = logging.getLogger('papyon.client')
 
 class Client(EventsDispatcher):
     """This class provides way to connect to the notification server as well
