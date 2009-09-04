@@ -93,12 +93,14 @@ from papyon.transport import *
 from papyon.switchboard_manager import SwitchboardManager
 from papyon.msnp2p import P2PSessionManager
 from papyon.p2p import MSNObjectStore, WebcamHandler
+from papyon.sip import SIPConnectionManager
 from papyon.conversation import SwitchboardConversation, \
     ExternalNetworkConversation
 from papyon.event import ClientState, ClientErrorType, \
     AuthenticationError, ProtocolError, EventsDispatcher
 
 import logging
+import uuid
 
 __all__ = ['Client']
 
@@ -110,7 +112,8 @@ class Client(EventsDispatcher):
         @sort: __init__, login, logout, state, profile, address_book,
                 msn_object_store, oim_box, spaces"""
 
-    def __init__(self, server, proxies={}, transport_class=DirectConnection):
+    def __init__(self, server, proxies={}, transport_class=DirectConnection,
+            version=15, client_type=msnp.ClientTypes.COMPUTER):
         """Initializer
 
             @param server: the Notification server to connect to.
@@ -128,12 +131,12 @@ class Client(EventsDispatcher):
 
         self._proxies = proxies
         self._transport_class = transport_class
-        self._proxies = proxies
+        self._client_type = client_type
 
         self._transport = transport_class(server, ServerType.NOTIFICATION,
                 self._proxies)
         self._protocol = msnp.NotificationProtocol(self, self._transport,
-                self._proxies)
+                self._proxies, version)
 
         self._switchboard_manager = SwitchboardManager(self)
         self._switchboard_manager.register_handler(SwitchboardConversation)
@@ -141,26 +144,26 @@ class Client(EventsDispatcher):
         self._p2p_session_manager = P2PSessionManager(self)
         self._webcam_handler = WebcamHandler(self)
         self._p2p_session_manager.register_handler(self._webcam_handler)
-        
+
+        self._call_manager = SIPConnectionManager(self, self._protocol)
+
         self._msn_object_store = MSNObjectStore(self)
         self._p2p_session_manager.register_handler(self._msn_object_store)
-        
-        
 
         self._external_conversations = {}
 
         self._sso = None
-        
         self._profile = None
         self._address_book = None
         self._oim_box = None
         self._mailbox = None
-        
+
         self.__die = False
         self.__connect_transport_signals()
         self.__connect_protocol_signals()
         self.__connect_switchboard_manager_signals()
         self.__connect_webcam_handler_signals()
+        self.__connect_call_manager_signals()
 
     ### public:
     @property
@@ -172,7 +175,7 @@ class Client(EventsDispatcher):
     @property
     def webcam_handler(self):
         return self._webcam_handler
-    
+
     @property
     def profile(self):
         """The profile of the current user
@@ -184,6 +187,12 @@ class Client(EventsDispatcher):
         """The address book of the current user
             @rtype: L{AddressBook<papyon.service.AddressBook>}"""
         return self._address_book
+
+    @property
+    def call_manager(self):
+        """The SIP connection manager
+            @type: L{SIPConnectionManager<papyon.sip.SIPConnectionManager>}"""
+        return self._call_manager
 
     @property
     def oim_box(self):
@@ -208,6 +217,24 @@ class Client(EventsDispatcher):
         """The state of this Client
             @rtype: L{papyon.event.ClientState}"""
         return self.__state
+
+    @property
+    def local_ip(self):
+        return self._transport.sockname[0]
+
+    @property
+    def protocol_version(self):
+        return self._protocol._protocol_version
+
+    @property
+    def client_type(self):
+        return self._client_type
+
+    @property
+    def machine_guid(self):
+        if not hasattr(self, '_guid'):
+            self._guid = str(uuid.uuid4())
+        return self._guid
 
     def login(self, account, password):
         """Login to the server.
@@ -277,19 +304,19 @@ class Client(EventsDispatcher):
         self.profile.connect("notify::personal-message", property_changed)
         self.profile.connect("notify::current-media", property_changed)
         self.profile.connect("notify::msn-object", property_changed)
-    
+
     def __connect_mailbox_signals(self):
         """Connect mailbox signals"""
         def new_mail_received(mailbox, mail):
             self._dispatch("on_mailbox_new_mail_received", mail)
-        
+
         def unread_changed(mailbox, unread_count, initial):
             method_name = "on_mailbox_unread_mail_count_changed"
             self._dispatch(method_name, unread_count, initial)
-            
+
         self.mailbox.connect("unread-mail-count-changed", unread_changed)
         self.mailbox.connect("new-mail-received", new_mail_received)
-        
+
     def __connect_contact_signals(self, contact):
         """Connect contact signals"""
         def event(contact, *args):
@@ -463,3 +490,10 @@ class Client(EventsDispatcher):
             self._dispatch("on_invite_webcam", session, producer)
 
         self._webcam_handler.connect("session-created", session_created)
+
+    def __connect_call_manager_signals(self):
+        """Connect SIP Call Manager signals"""
+        def invite_received(call_manager, call):
+            self._dispatch("on_invite_conference", call)
+
+        self._call_manager.connect("invite-received", invite_received)

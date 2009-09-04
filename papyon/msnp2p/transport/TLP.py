@@ -74,7 +74,7 @@ class TLPHeader(object):
                 self.dw1,
                 self.dw2,
                 self.qw1)
-    
+
     @staticmethod
     def parse(header_data):
         header = struct.unpack("<LLQQLLLLQ", header_data[:48])
@@ -106,8 +106,12 @@ class TLPFlag(object):
 
 
 class MessageChunk(object):
-    def __init__(self, header, body):
+    def __init__(self, header=None, body=None):
+        if header is None:
+            header = TLPHeader()
         self.header = header
+        if body is None:
+            body = ""
         self.body = body
         self.application_id = 0
 
@@ -120,15 +124,52 @@ class MessageChunk(object):
     def is_ack_chunk(self):
         return self.header.flags & (TLPFlag.NAK | TLPFlag.ACK)
 
+    def is_nonce_chunk(self):
+        return self.header.flags & TLPFlag.KEY
+
+    def has_progressed(self):
+        return self.header.flags & TLPFlag.EACH
+
     def require_ack(self):
         if self.is_ack_chunk():
             return False
-        #if self.header.flags & TLPFlag.EACH:
-        #    return True
         current_size = self.header.chunk_size + self.header.blob_offset
         if current_size == self.header.blob_size:
             return True
         return False
+
+    def get_nonce(self):
+        """Get the nonce from the chunk. The chunk needs to have the KEY flag
+           for that nonce to make sense (use is_nonce_chunk to check that)"""
+
+        if not self.is_nonce_chunk():
+            return "00000000-0000-0000-0000-000000000000"
+
+        bytes = ""
+        bytes += struct.pack(">L", self.header.dw1)
+        bytes += struct.pack(">H", self.header.dw2 & 0xFFFF)
+        bytes += struct.pack(">H", self.header.dw2 >> 16)
+        bytes += struct.pack("<Q", self.header.qw1)
+
+        nonce = [("%X" % ord(byte)).zfill(2) for byte in bytes]
+        for idx in (4, 7, 10, 13):
+            nonce.insert(idx, '-')
+        return "".join(nonce)
+
+    def set_nonce(self, nonce):
+        """Set the chunk headers from a nonce and make it a nonce chunk by
+           adding the KEY flag."""
+
+        nonce = filter(lambda c: c not in '{-}', nonce)
+        bytes = ""
+        for i in range(0, len(nonce), 2):
+            bytes += chr(int(nonce[i:i+2], 16))
+
+        self.header.dw1 = struct.unpack(">L", bytes[0:4])[0]
+        self.header.dw2 = struct.unpack(">H", bytes[4:6])[0]
+        self.header.dw2 += struct.unpack(">H", bytes[6:8])[0] << 16
+        self.header.qw1 = struct.unpack("<Q", bytes[8:16])[0]
+        self.header.flags |= TLPFlag.KEY
 
     @staticmethod
     def parse(data):
@@ -139,7 +180,7 @@ class MessageChunk(object):
 
 class MessageBlob(object):
     def __init__(self, application_id, data, total_size=None,
-            session_id=None, blob_id=None):
+            session_id=None, blob_id=None, is_file=False):
         if data is not None:
             if isinstance(data, str):
                 if len(data) > 0:
@@ -163,6 +204,7 @@ class MessageBlob(object):
             session_id = _generate_id()
         self.session_id = session_id
         self.id = blob_id or _generate_id()
+        self.is_file = is_file
 
     def __del__(self):
         #if self.data is not None:
@@ -193,8 +235,17 @@ class MessageBlob(object):
     def is_complete(self):
         return self.transferred == self.total_size
 
+    def is_data_blob(self):
+        return not self.is_control_blob()
+
     def is_control_blob(self):
         return False
+
+    def read_data(self):
+        self.data.seek(0, 0)
+        data = self.data.read()
+        self.data.seek(0, 0)
+        return data
 
     def get_chunk(self, max_size):
         blob_offset = self.transferred
@@ -215,6 +266,8 @@ class MessageBlob(object):
         header.dw1 = _chunk_id()
         if self.session_id != 0 and self.total_size != 4 and data != '\x00' * 4:
             header.flags = TLPFlag.EACH
+            if self.is_file:
+                header.flags |= TLPFlag.FILE
 
         chunk = MessageChunk(header, data)
         chunk.application_id = self.application_id

@@ -4,6 +4,7 @@ papyon-0.4.2 (UNRELEASED)
 Enhancements:
   * Bumped minimal required Python version to 2.5
   * Dropped dependency on pyCrypto
+  * Added support for audio and video conferences
 
 Fixes:
   * Fixed crash when FindMemberships response is empty (Bug #23039)
@@ -12,6 +13,8 @@ Fixes:
     book error is triggered (Bugs #14371, #15869)
   * Fixed sending of messages to contacts using Microsoft Messenger for Mac
   * Fixed some encoding issues with Python 2.6 loggin (only supports unicode)
+  * Send new client capabilities to the server when changed (Bug #13982)
+  * Fixed crash when receiving badly formed UBX command (Bug #17917)
 
 papyon-0.4.1 (2009-07-28)
 =========================

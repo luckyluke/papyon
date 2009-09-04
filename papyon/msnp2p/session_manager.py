@@ -32,7 +32,7 @@ import logging
 
 __all__ = ['P2PSessionManager']
 
-logger = logging.getLogger('papyon.msnp2p.session-manager')
+logger = logging.getLogger('papyon.msnp2p.session_manager')
 
 class P2PSessionManager(gobject.GObject):
     __gsignals__ = {
@@ -53,6 +53,8 @@ class P2PSessionManager(gobject.GObject):
                 lambda tr, blob: self._on_blob_received(blob))
         self._transport_manager.connect("blob-sent",
                 lambda tr, blob: self._on_blob_sent(blob))
+        self._transport_manager.connect("chunk-transferred",
+                lambda tr, chunk: self._on_chunk_transferred(chunk))
 
     def register_handler(self, handler_class):
         self._handlers.append(handler_class)
@@ -63,38 +65,47 @@ class P2PSessionManager(gobject.GObject):
     def _unregister_session(self, session):
         del self._sessions[session.id]
 
+    def _on_chunk_transferred(self, chunk):
+        session_id = chunk.header.session_id
+        if session_id == 0:
+            return
+        session = self._get_session(session_id)
+        if session is None:
+            return
+        session._on_data_chunk_transferred(chunk)
+
+    def _get_session(self, session_id):
+        if session_id in self._sessions:
+            return self._sessions[session_id]
+        else:
+            return None
+
+    def _search_session_by_call(self, call_id):
+        for session in self._sessions.itervalues():
+            if session.call_id == call_id:
+                return session
+        return None
+
     def _blob_to_session(self, blob):
+        session_id = blob.session_id
+
         # Check to see if it's a signaling message
-        if blob.session_id == 0:
-            blob.data.seek(0, 0)
-            slp_data = blob.data.read()
-            blob.data.seek(0, 0)
+        if session_id == 0:
+            slp_data = blob.read_data()
             try:
                 message = SLPMessage.build(slp_data)
             except ParseError:
+                print slp_data
                 logger.warning('Received blob with SessionID=0 and non SLP data')
                 raise SLPError("Non SLP data for blob with null sessionID")
             session_id = message.body.session_id
 
-            # Backward compatible with older clients that use the call-id
-            # for responses
-            if session_id == 0:
-                call_id = message.call_id
-                for session in self._sessions.itervalues():
-                    if session.call_id == call_id:
-                        return session
-                # Couldn't find a session for the call id we received
-                return None
-            if session_id in self._sessions:
-                return self._sessions[session_id]
-            # Session doesn't exist
-            return None
-        else:
-            session_id = blob.session_id
-            if session_id in self._sessions:
-                return self._sessions[blob.session_id]
-            else:
-                raise SLPSessionError("Unknown session")
+        # Backward compatible with older clients that use the call-id
+        # for responses
+        if session_id == 0:
+            return self._search_session_by_call(message.call_id)
+
+        return self._get_session(session_id)
 
     def _on_blob_received(self, blob):
         try:
@@ -105,22 +116,18 @@ class P2PSessionManager(gobject.GObject):
             # We can't send a '500 Internal Error' response since we can't
             # parse the SLP, so we don't know who to send it to, or the call-id, etc...
             return
-        except SLPSessionError:
-            # This means that we received a data packet for an unknown session
-            # We must RESET the session just like the official client does
-            # TODO send a TLP
-            logger.error("SLPSessionError")
-            return
 
         # The session could not be found, create a new one if necessary
         if session is None:
-            # Parse the SLP message. We know it's an SLP because if it was a data packet
-            # we would have received a ProtocolError exception
-            blob.data.seek(0, 0)
-            slp_data = blob.data.read()
-            blob.data.seek(0, 0)
+            if blob.session_id != 0:
+                # This means that we received a data packet for an unknown session
+                # We must RESET the session just like the official client does
+                # TODO send a TLP
+                logger.error("SLPSessionError")
+                return
 
             # No need to 'try', if it was invalid, we would have received an SLPError
+            slp_data = blob.read_data()
             message = SLPMessage.build(slp_data)
             session_id = message.body.session_id
 
@@ -130,27 +137,15 @@ class P2PSessionManager(gobject.GObject):
             if session_id == 0:
                 # TODO send a 500 internal error
                 logger.error("Session_id == 0")
-
-
                 return
 
             # If there was no session then create one only if it's an INVITE
             if isinstance(message, SLPRequestMessage) and \
                     message.method == SLPRequestMethod.INVITE:
-                # Find the contact we received the message from
-                contacts = self._client.address_book.contacts.\
-                           search_by_network_id(papyon.profile.NetworkID.MSN).\
-                           search_by_account(message.frm)
-                if len(contacts) == 0:
-                    peer = papyon.profile.Contact(id=0,
-                                                 network_id=papyon.profile.NetworkID.MSN,
-                                                 account=message.frm,
-                                                 display_name=message.frm)
-                else:
-                    peer = contacts[0]
-
-                # Create the session depending on the type of the message
                 if isinstance(message.body, SLPSessionRequestBody):
+                    # Find the contact we received the message from
+                    peer = self._client.address_book.search_or_build_contact(
+                            message.frm, papyon.profile.NetworkID.MSN)
                     try:
                         for handler in self._handlers:
                             if handler._can_handle_message(message):
@@ -165,17 +160,15 @@ class P2PSessionManager(gobject.GObject):
                         #TODO: answer with a 603 Decline ?
                         logger.error("SLPError")
                         return None
+                elif isinstance(message.body, SLPTransferRequestBody):
+                    session = self._sessions[session_id]
                 else:
                     return None
-                #elif isinstance(message.body, SLPTransferRequestBody):
-                #    pass
             else:
-                logger.warning('Received initial blob with SessionID=0 and non INVITE SLP data') #FIXME - pick up properly on the transreq
-
+                logger.warning('Received initial blob with SessionID=0 and non INVITE SLP data')
                 #TODO: answer with a 500 Internal Error
                 return None
 
-        # The session should be notified of this blob
         session._on_blob_received(blob)
 
     def _on_blob_sent(self, blob):

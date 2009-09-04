@@ -34,7 +34,7 @@ __all__ = ['Profile', 'Contact', 'Group',
         'Presence', 'Membership', 'ContactType', 'Privacy', 'NetworkID', 'ClientCapabilities']
 
 
-class ClientCapabilities(object):
+class ClientCapabilities(gobject.GObject):
     """Capabilities of the client. This allow adverstising what the User Agent
     is capable of, for example being able to receive video stream, and being
     able to receive nudges...
@@ -99,6 +99,9 @@ class ClientCapabilities(object):
         @ivar supports_sip_invite: does the client supports SIP
         @type supports_sip_invite: bool
 
+        @ivar supports_tunneled_sip: does the client supports tunneled SIP
+        @type supports_tunneled_sip: bool
+
         @ivar supports_shared_drive: does the client supports File sharing
         @type supports_shared_drive: bool
 
@@ -110,6 +113,24 @@ class ClientCapabilities(object):
 
         @undocumented: __getattr__, __setattr__, __str__
         """
+
+    __gsignals__ =  {
+            "capability-changed": (gobject.SIGNAL_RUN_FIRST,
+                gobject.TYPE_NONE,
+                (object, object)),
+            }
+
+    MSNC = [0x0,        # MSNC0
+            0x10000000, # MSNC1
+            0x20000000, # MSNC2
+            0x30000000, # MSNC3
+            0x40000000, # MSNC4
+            0x50000000, # MSNC5
+            0x60000000, # MSNC6
+            0x70000000, # MSNC7
+            0x80000000, # MSNC8
+            0x90000000, # MSNC9
+            0xA0000000] # MSNC10
 
     _CAPABILITIES = {
             'is_bot': 0x00020000,
@@ -137,50 +158,76 @@ class ClientCapabilities(object):
             'supports_voice_im': 0x00040000,
             'supports_secure_channel': 0x00080000,
             'supports_sip_invite': 0x00100000,
+            'supports_tunneled_sip': 0x00200000,
             'supports_shared_drive': 0x00400000,
 
+            'p2p_aware': 0xF0000000,
             'p2p_supports_turn': 0x02000000,
             'p2p_bootstrap_via_uun': 0x04000000
             }
 
-    def __init__(self, msnc=0, client_id=0):
+    _EXTRA = {
+            'supports_rtc_video': 0x00000010,
+            'unknown': 0x00000020
+            }
+
+    def __init__(self, msnc=0, client_id="0:0"):
         """Initializer
 
             @param msnc: The MSNC version
-            @type msnc: integer < 8 and >= 0
+            @type msnc: integer < 11 and >= 0
 
             @param client_id: the full client ID"""
-        MSNC = (0x0,        # MSNC0
-                0x10000000, # MSNC1
-                0x20000000, # MSNC2
-                0x30000000, # MSNC3
-                0x40000000, # MSNC4
-                0x50000000, # MSNC5
-                0x60000000, # MSNC6
-                0x70000000) # MSNC7
-        object.__setattr__(self, 'client_id', MSNC[msnc] | client_id)
+        gobject.GObject.__init__(self)
+        caps = client_id.split(":")
+        capabilities = int(caps[0])
+        if len(caps) > 1:
+            extra = int(caps[1])
+        else:
+            extra = 0
+        object.__setattr__(self, 'capabilities', self.MSNC[msnc] | capabilities)
+        object.__setattr__(self, 'extra', extra)
 
     def __getattr__(self, name):
-        if name == "p2p_aware":
-            mask = 0xf0000000
-        elif name in self._CAPABILITIES:
+        if name in self._CAPABILITIES:
             mask = self._CAPABILITIES[name]
+            id = self.capabilities
+        elif name in self._EXTRA:
+            mask = self._EXTRA[name]
+            id = self.extra
         else:
             raise AttributeError("object 'ClientCapabilities' has no attribute '%s'" % name)
-        return (self.client_id & mask != 0)
+        return (id & mask != 0)
 
     def __setattr__(self, name, value):
         if name in self._CAPABILITIES:
             mask = self._CAPABILITIES[name]
+            old_value = bool(self.capabilities & mask)
             if value:
-                object.__setattr__(self, 'client_id', self.client_id | mask)
+                object.__setattr__(self, 'capabilities', self.capabilities | mask)
             else:
-                object.__setattr__(self, 'client_id', self.client_id ^ mask)
+                object.__setattr__(self, 'capabilities', self.capabilities & ~mask)
+            if value != old_value
+                self.emit('capability-changed', name, value)
+        elif name in self._EXTRA:
+            mask = self._EXTRA[name]
+            old_value = bool(self.extra & mask)
+            if value:
+                object.__setattr__(self, 'extra', self.extra | mask)
+            else:
+                object.__setattr__(self, 'extra', self.extra & ~mask)
+            if value != old_value
+                self.emit('capability-changed', name, value)
         else:
             raise AttributeError("object 'ClientCapabilities' has no attribute '%s'" % name)
 
     def __str__(self):
-        return str(self.client_id)
+        msnc = self.MSNC.index(self.capabilities & 0xF0000000)
+        if msnc >= 9:
+            client_id = "%s:%s" % (self.capabilities, self.extra)
+        else:
+            client_id = str(self.capabilities)
+        return client_id
 
 
 class NetworkID(object):
@@ -312,10 +359,14 @@ class Profile(gobject.GObject):
                 "The current media that the user wants to display",
                 gobject.PARAM_READABLE),
 
-            "profile": (gobject.TYPE_STRING,
+            "signature-sound": (gobject.TYPE_PYOBJECT,
+                "Signature sound",
+                "The sound played by others' client when the user connects",
+                gobject.PARAM_READABLE),
+
+            "profile": (gobject.TYPE_PYOBJECT,
                 "Profile",
                 "the text/x-msmsgsprofile sent by the server",
-                "",
                 gobject.PARAM_READABLE),
 
             "presence": (gobject.TYPE_STRING,
@@ -350,15 +401,17 @@ class Profile(gobject.GObject):
         self._privacy = Privacy.BLOCK
         self._personal_message = ""
         self._current_media = None
+        self._signature_sound = None
+        self._end_point_name = ""
 
-        self.client_id = ClientCapabilities(7)
-        #self.client_id.supports_sip_invite = True
-        #FIXME: this should only be advertised when a webcam is plugged
-        #self.client_id.has_webcam = True
+        self.client_id = ClientCapabilities(10)
+        self.client_id.supports_sip_invite = True
+        #self.client_id.supports_tunneled_sip = True
+        self._client_id.connect("capability-changed", self._client_capability_changed)
 
         self._msn_object = None
 
-        self.__pending_set_presence = [self._presence, self.client_id, self._msn_object]
+        self.__pending_set_presence = [self._presence, self._client_id, self._msn_object]
         self.__pending_set_personal_message = [self._personal_message, self._current_media]
 
     @property
@@ -376,7 +429,7 @@ class Profile(gobject.GObject):
     @property
     def profile(self):
         """The user profile retrieved from the MSN servers
-            @rtype: utf-8 encoded string"""
+            @rtype: dict of fields"""
         return self._profile
 
     @property
@@ -384,6 +437,12 @@ class Profile(gobject.GObject):
         """The user identifier in a GUID form
             @rtype: GUID string"""
         return "00000000-0000-0000-0000-000000000000"
+
+    @property
+    def client_id(self):
+        """The user capabilities
+            @rtype: ClientCapabilities"""
+        return self._client_id
 
     @rw_property
     def display_name():
@@ -447,6 +506,29 @@ class Profile(gobject.GObject):
         return locals()
 
     @rw_property
+    def signature_sound():
+        """The sound played when you are connecting
+            @type: string"""
+        def fset(self, signature_sound):
+            if signature_sound == self._signature_sound:
+                return
+            self.__pending_set_personal_message[2] = signature_sound
+            self._ns_client.set_personal_message(*self.__pending_set_personal_message)
+        def fget(self):
+            return self._signature_sound
+        return locals()
+
+    @rw_property
+    def end_point_name():
+        def fset(self, name):
+            if name == self._end_point_name:
+                return
+            self._ns_client.set_end_point_name(name)
+        def fget(self):
+            return self._end_point_name
+        return locals()
+
+    @rw_property
     def msn_object():
         """The MSNObject attached to your contact, this MSNObject represents the
         display picture to be shown to your peers
@@ -489,6 +571,10 @@ class Profile(gobject.GObject):
 
     def request_profile_url(self, callback):
         self._ns_client.send_url_request(('PROFILE', '0x0409'), callback)
+
+    def _client_capability_changed(self, name, value):
+        self.__pending_set_presence[1] = self._client_id
+        self._ns_client.set_presence(*self.__pending_set_presence)
 
     def _server_property_changed(self, name, value):
         attr_name = "_" + name.lower().replace("-", "_")
@@ -538,6 +624,11 @@ class Contact(gobject.GObject):
                 "The current media that the user wants to display",
                 gobject.PARAM_READABLE),
 
+            "signature-sound": (gobject.TYPE_PYOBJECT,
+                "Signature sound",
+                "The sound played by others' client when the user connects",
+                gobject.PARAM_READABLE),
+
             "presence": (gobject.TYPE_STRING,
                 "Presence",
                 "The presence to show to others",
@@ -559,10 +650,10 @@ class Contact(gobject.GObject):
                 "The contact automatic update status flag",
                  gobject.PARAM_READABLE),
 
-            "client-capabilities": (gobject.TYPE_UINT64,
+            "client-capabilities": (gobject.TYPE_STRING,
                 "Client capabilities",
                 "The client capabilities of the contact 's client",
-                0, 0xFFFFFFFF, 0,
+                "",
                 gobject.PARAM_READABLE),
 
             "msn-object": (gobject.TYPE_STRING,
@@ -586,6 +677,7 @@ class Contact(gobject.GObject):
         self._presence = Presence.OFFLINE
         self._personal_message = ""
         self._current_media = None
+        self._signature_sound = None
         self._groups = set()
 
         self._memberships = memberships
@@ -666,6 +758,12 @@ class Contact(gobject.GObject):
         """Contact current media
             @rtype: (artist: string, track: string)"""
         return self._current_media
+
+    @property
+    def signature_sound():
+        """Contact signature sound
+            @type: string"""
+        return self._signature_sound
 
     @property
     def groups(self):
@@ -774,7 +872,7 @@ class Contact(gobject.GObject):
         self._server_property_changed("personal-message", "")
         self._server_property_changed("current-media", None)
         self._server_property_changed("msn-object", None)
-        self._server_property_changed("client-capabilities", 0)
+        self._server_property_changed("client-capabilities", "0:0")
         self._server_infos_changed({})
 
 

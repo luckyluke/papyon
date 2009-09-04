@@ -29,214 +29,267 @@ from papyon.util.decorator import rw_property
 import papyon.util.element_tree as ElementTree
 import struct
 
-import papyon.util.guid as guid
-
 import gobject
+import logging
 import base64
 import random
 
+from papyon.media import MediaCall, MediaCandidate, MediaCandidateEncoder, \
+                         MediaSessionMessage, MediaStreamDescription
+from papyon.media.constants import MediaStreamDirection, MediaSessionType
+
 __all__ = ['WebcamSession']
 
-class WebcamSession(P2PSession, EventsDispatcher):
+logger = logging.getLogger("papyon.msnp2p.webcam")
 
-    def __init__(self, producer, session_manager, peer, \
-                     euf_guid,  message = None):
-        P2PSession.__init__(self, session_manager, peer, \
-                                euf_guid, ApplicationID.WEBCAM)
+class WebcamSession(P2PSession, MediaCall, EventsDispatcher):
+
+    def __init__(self, producer, session_manager, peer,
+            euf_guid,  message=None):
+        if producer:
+            type = MediaSessionType.WEBCAM_SEND
+        else:
+            type = MediaSessionType.WEBCAM_RECV
+
+        P2PSession.__init__(self, session_manager, peer, euf_guid,
+                ApplicationID.WEBCAM, message)
+        MediaCall.__init__(self, type)
         EventsDispatcher.__init__(self)
 
         self._producer = producer
-
-        if message is not None:
-            self._call_id = message.call_id
-            self._cseq = message.cseq
-            self._branch = message.branch
-            self._id = message.body.session_id
-
+        self._answered = False
         self._sent_syn = False
-        self._local_candidates = None
-        self._remote_candidates = None
-        self._session_id = 0
+        self._session_id = self._generate_id(9999)
         self._xml_needed = False
-        self._session_manager._register_session(self)
 
-    @rw_property
-    def local_candidates():
-        def fget(self):
-            return self._local_candidates
-        def fset(self, candidates):
-            self._local_candidates = candidates
-            if self._xml_needed and self._session_id != 0:
-                self._send_xml()
-                self._xml_needed = False
-        return locals()
-
-    @rw_property
-    def session_id():
-        def fget(self):
-            return self._session_id
-        def fset(self, session_id):
-            self._session_id = session_id
-            if self._xml_needed and self._local_candidates != 0:
-                self._send_xml()
-                self._xml_needed = False
-        return locals()
-
-    @property
-    def remote_candidates(self):
-        return self._remote_candidates
-  
-    @property
-    def codecs(self):
-        return [Codec.ML20]
-  
     def invite(self):
+        self._answered = True
         context = "{B8BE70DE-E2CA-4400-AE03-88FF85B9F4E8}"
-        body = SLPSessionRequestBody(EufGuid.MEDIA_SESSION, self._application_id,
-                context.decode('ascii').encode('utf-16_le'), self._id)
-        message = SLPRequestMessage(SLPRequestMethod.INVITE,
-                "MSNMSGR:" + self._peer.account,
-                to=self._peer.account,
-                frm=self._session_manager._client.profile.account,
-                branch=self._branch,
-                cseq=self._cseq,
-                call_id=self._call_id)
-        message.body = body
-
-        self._call_id = message.call_id
-        self._cseq = message.cseq
-        self._branch = message.branch
-        self._send_p2p_data(message)
+        context = context.decode('ascii').encode('utf-16_le')
+        self._invite(context)
 
     def accept(self):
+        self._answered = True
         temp_application_id = self._application_id
         self._application_id = 0
         self._respond(200)
-        self.send_transreq()
         self._application_id = temp_application_id
-
-    def reject(self):
-        self._respond(603)
-
-    def send_transreq(self):
-        self._cseq=0
-        body = SLPTransferRequestBody(self._euf_guid, self._application_id,None,
-                                     None)
-        message = SLPRequestMessage(SLPRequestMethod.INVITE,
-                "MSNMSGR:" + self._peer.account,
-                to=self._peer.account,
-                frm=self._session_manager._client.profile.account,
-                branch=self._branch,
-                cseq=self._cseq,
-                call_id=self._call_id)
-        message.body = body
-        self._application_id=0
-        self._send_p2p_data(message)
-        self._application_id=4
         self.send_binary_syn()
 
-    def _on_blob_received(self, blob):
+    def reject(self):
+        self._answered = True
+        self._respond(603)
+
+    def end(self):
+        if not self._answered:
+            self.reject()
+        else:
+            context = '\x74\x03\x00\x81'
+            self._close(context)
+        self.dispose()
+
+    def dispose(self):
+        MediaCall.dispose(self)
+        self._dispatch("on_call_ended")
+        self._dispose()
+
+    def on_media_session_prepared(self, session):
+        if self._xml_needed:
+            self._send_xml()
+
+    def _on_invite_received(self, message):
+        if self._producer:
+            stream = self.media_session.create_stream("video",
+                    MediaStreamDirection.SENDING, False)
+            self.media_session.add_stream(stream)
+
+    def _on_bye_received(self, message):
+        self.dispose()
+
+    def _on_session_accepted(self):
+        self._dispatch("on_call_accepted")
+
+    def _on_session_rejected(self, message):
+        self._dispatch("on_call_rejected", message)
+
+    def _on_data_blob_received(self, blob):
+        blob.data.seek(0, 0)
         data = blob.data.read()
-
-        if blob.session_id == 0:
-            message = SLPMessage.build(data)
-            if isinstance(message, SLPResponseMessage):
-                if message.status is 200:
-                    self._dispatch("on_webcam_accepted")
-                elif message.status is 603:
-                    self._dispatch("on_webcam_rejected")
-
-            # FIXME: handle the signaling correctly
-            # Determine if it actually is a transreq or not
-            # send 603
-            return
+        data = unicode(data[10:], "utf-16-le").rstrip("\x00")
 
         if not self._sent_syn:
             self.send_binary_syn() #Send 603 first ?
-        if '\x00s\x00y\x00n\x00\x00\x00' in data:
+        if data == 'syn':
             self.send_binary_ack()
-        elif '\x00a\x00c\x00k\x00\x00\x00' in data:
-            if self._producer:
-                if self._local_candidates is not None:
-                    self._send_xml()
-                else:
-                    self._xml_needed = True
-        elif ('\x00<\x00p\x00r\x00o\x00d\x00u\x00c\x00e\x00r\x00>\x00' in data) \
-                or ('\x00<\x00v\x00i\x00e\x00w\x00e\x00r\x00>\x00' in data):
-            self._handle_xml(blob)
+        elif data == 'ack' and self._producer:
+            self._send_xml()
+        elif '<producer>' in data or '<viewer>' in data:
+            self._handle_xml(data)
+        elif data.startswith('ReflData'):
+            refldata = data.split(':')[1]
+            str = ""
+            for i in range(0, len(refldata), 2):
+                str += chr(int(refldata[i:i+2], 16))
+            print "Got ReflData :", str
 
-    def send_binary_syn(self):
-        syn='\x80\x11\x11\x01\x08\x00\x08\x00\x00\x00s\x00y\x00n\x00\x00\x00'
-        footer='\x00\x00\x00\x04'
-        self._send_p2p_data(syn)
-        self._sent_syn = True
-        
-    def send_binary_ack(self):
-        ack='\x80\xea\x00\x00\x08\x00\x08\x00\x00\x00a\x00c\x00k\x00\x00\x00'
-        footer='\x00\x00\x00\x04'
-        self._send_p2p_data(ack)
-        
-    def send_binary_viewer_data(self):
-        data = '\x80\xec\xc7\x03\x08\x00&\x00\x00\x00r\x00e\x00c\x00e\x00i\x00v\x00e\x00d\x00V\x00i\x00e\x00w\x00e\x00r\x00D\x00a\x00t\x00a\x00\x00\x00'
-        footer='\x00\x00\x00\x04'
-        self._send_p2p_data(data)
-
-    def _send_xml(self):
-        if self._producer:
-            s = "<producer>"
-        else:
-            s = "<viewer>"
-
-        s += "<version>2.0</version><rid>%s</rid><session>%u</session><ctypes>0</ctypes><cpu>2010</cpu>" % \
-            (self._local_candidates[0][2],
-             self._session_id)
-        
-        s += "<tcp>"
-        s += "<tcpport>%(port)u</tcpport>\t\t\t\t\t\t\t\t  <tcplocalport>%(port)u</tcplocalport>\t\t\t\t\t\t\t\t  <tcpexternalport>%(port)u</tcpexternalport>" \
-            % { "port" : self._local_candidates[0][1] }
-        for i, candidate in enumerate(self._local_candidates):
-            s += "<tcpipaddress%u>%s</tcpipaddress%u>" % (i + 1, candidate[0], i + 1)
-        s += "</tcp>"
-        s += "<codec></codec><channelmode>2</channelmode>"
-        
-        if self._producer:
-            s += "</producer>"
-        else:
-            s += "</viewer>"
-        s += "\r\n\r\n"
-        message_bytes = s.encode("utf-16-le") + "\x00\x00"
+    def send_data(self, data):
+        message_bytes = data.encode("utf-16-le") + "\x00\x00"
         id = (self._generate_id() << 8) | 0x80
         header = struct.pack("<LHL", id, 8, len(message_bytes))
-        self._send_p2p_data(header+message_bytes)
+        self._send_p2p_data(header + message_bytes)
 
-    def _handle_xml(self,blob):
-        blob.data.seek(10, 0)
-        data = blob.data.read()
-        datastr = str(data).replace("\000","")
-        message = unicode(data, "utf-16-le").rstrip("\x00")
-        tree = ElementTree.fromstring(datastr)
-        ips = []
-        ports = []
-        for node in tree.findall("tcp/*"):
-            if node.tag == "tcpport":
-                ports.append(int(node.text))
-            elif node.tag.startswith("tcpipaddress"):
-                ips.append(node.text)
-        rid = tree.find("rid").text
-        self._session_id = int(tree.find("session").text)
+    def send_binary_syn(self):
+        self.send_data('syn')
+        self._sent_syn = True
 
-        self._remote_candidates = []
-        for ip in ips:
-            for port in ports:
-                candidate = (ip, port, rid)
-                self._remote_candidates.append(candidate)
+    def send_binary_ack(self):
+        self.send_data('ack')
 
-        # Signalling is done, now pass it off to the handler to control it further
-        print "Received xml %s" % message
-        self._dispatch("on_webcam_viewer_data_received", self._session_id, rid, self._remote_candidates)
+    def send_binary_viewer_data(self):
+        self.send_data('receivedViewerData')
+
+    def _send_xml(self):
+        if not self.media_session.prepared:
+            self._xml_needed = True
+            return
+        logger.info("Send XML for session %i", self._session_id)
+        self._xml_needed = False
+        message = WebcamSessionMessage(session=self.media_session,
+                id=self._session_id, producer=self._producer)
+        self.send_data(str(message))
+
+    def _handle_xml(self, data):
+        message = WebcamSessionMessage(body=data, producer=self._producer)
+        initial = not self._producer
+        self.media_session.process_remote_message(message, initial)
+        self._session_id = message.id
+        logger.info("Received XML data for session %i", self._session_id)
         if self._producer:
             self.send_binary_viewer_data()
-        elif self._local_candidates is not None:
-            self._send_xml()
         else:
-            self._xml_needed = True
+            self._send_xml()
+
+class WebcamCandidateEncoder(MediaCandidateEncoder):
+
+    def __init__(self):
+        MediaCandidateEncoder.__init__(self)
+
+    def encode_candidates(self, desc, local_candidates, remote_candidates):
+        for candidate in local_candidates:
+            desc.ips.append(candidate.ip)
+            desc.ports.append(candidate.port)
+        desc.rid = int(local_candidates[0].foundation)
+        desc.sid = int(local_candidates[0].username)
+
+    def decode_candidates(self, desc):
+        local_candidates = []
+        remote_candidate = []
+
+        for ip in desc.ips:
+            for port in desc.ports:
+                candidate = MediaCandidate()
+                candidate.foundation = str(desc.rid)
+                candidate.component_id = 1
+                candidate.username = str(desc.sid)
+                candidate.password = ""
+                candidate.ip = ip
+                candidate.port = port
+                candidate.transport = "TCP"
+                candidate.priority = 1
+                local_candidates.append(candidate)
+
+        return local_candidates, remote_candidate
+
+
+class WebcamSessionMessage(MediaSessionMessage):
+
+    def __init__(self, session=None, body=None, id=0, producer=False):
+        self._id = id
+        self._producer = producer
+        MediaSessionMessage.__init__(self, session, body)
+
+    @property
+    def id(self):
+        return self._id
+
+    @property
+    def producer(self):
+        return self._producer
+
+    def _create_stream_description(self, stream):
+        return WebcamStreamDescription(stream, self._id, self._producer)
+
+    def _parse(self, body):
+        tree = ElementTree.fromstring(body)
+        self._id = int(tree.find("session").text)
+        desc = self._create_stream_description(None)
+        self.descriptions.append(desc)
+        for node in tree.findall("tcp/*"):
+            if node.tag == "tcpport":
+                desc.ports.append(int(node.text))
+            elif node.tag.startswith("tcpipaddress"):
+                desc.ips.append(node.text)
+        desc.rid = tree.find("rid").text
+        return self._descriptions
+
+    def __str__(self):
+        tag = self.producer and "producer" or "viewer"
+        desc = self._descriptions[0]
+        body = "<%s>" \
+            "<version>2.0</version>" \
+            "<rid>%s</rid>" \
+            "<session>%u</session>" \
+            "<ctypes>0</ctypes>" \
+            "<cpu>2010</cpu>" % (tag, desc.rid, desc.sid)
+        body += "<tcp>" \
+            "<tcpport>%(port)u</tcpport>" \
+            "<tcplocalport>%(port)u</tcplocalport>" \
+            "<tcpexternalport>0</tcpexternalport>" % \
+            {"port":  desc.ports[0]}
+        for i, addr in enumerate(desc.ips):
+            body += "<tcpipaddress%u>%s</tcpipaddress%u>" % (i + 1, addr, i + 1)
+        body += "</tcp>"
+        body += "<codec></codec><channelmode>2</channelmode>"
+        body += "</%s>\r\n\r\n" % tag
+        return body
+
+class WebcamStreamDescription(MediaStreamDescription):
+
+    _candidate_encoder = WebcamCandidateEncoder()
+
+    def __init__(self, stream, sid, producer):
+        direction = producer and MediaStreamDirection.SENDING or \
+                MediaStreamDirection.RECEIVING
+        self._ips = []
+        self._ports = []
+        self._rid = None
+        self._sid = sid
+        MediaStreamDescription.__init__(self, stream, "video", direction)
+
+    @property
+    def candidate_encoder(self):
+        return self._candidate_encoder
+
+    @property
+    def ips(self):
+        return self._ips
+
+    @property
+    def ports(self):
+        return self._ports
+
+    @rw_property
+    def rid():
+        def fget(self):
+            return self._rid
+        def fset(self, value):
+            self._rid = value
+        return locals()
+
+    @rw_property
+    def sid():
+        def fget(self):
+            return self._sid
+        def fset(self, value):
+            self._sid = value
+        return locals()

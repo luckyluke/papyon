@@ -72,6 +72,10 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                 gobject.TYPE_NONE,
                 ()),
 
+            "buddy-notification-received" : (gobject.SIGNAL_RUN_FIRST,
+                gobject.TYPE_NONE,
+                (object, object,)),
+
             "mail-received" : (gobject.SIGNAL_RUN_FIRST,
                 gobject.TYPE_NONE,
                 (object,)),
@@ -93,7 +97,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                 gobject.PARAM_READABLE)
             }
 
-    def __init__(self, client, transport, proxies={}):
+    def __init__(self, client, transport, proxies={}, version=15):
         """Initializer
 
             @param client: the parent instance of L{client.Client}
@@ -109,7 +113,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         BaseProtocol.__init__(self, client, transport, proxies)
         gobject.GObject.__init__(self)
         self.__state = ProtocolState.CLOSED
-        self._protocol_version = 0
+        self._protocol_version = version
         self._url_callbacks = {} # tr_id=>callback
 
     # Properties ------------------------------------------------------------
@@ -158,7 +162,8 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                 ('MFN', urllib.quote(display_name)))
 
     @throttled(2000, LastElementQueue())
-    def set_personal_message(self, personal_message='', current_media=None):
+    def set_personal_message(self, personal_message='', current_media=None,
+            signature_sound=None):
         """Sets the new personal message
 
             @param personal_message: the new personal message
@@ -166,21 +171,42 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         cm = ''
         if current_media is not None:
             cm ='\\0Music\\01\\0{0} - {1}\\0%s\\0%s\\0\\0' % \
-                (xml_utils.escape(current_media[0]), 
+                (xml_utils.escape(current_media[0]),
                  xml_utils.escape(current_media[1]))
+
+        if signature_sound is not None:
+            signature_sound = xml_utils.escape(signature_sound)
+            ss = '<SignatureSound>%s</SignatureSound>' % signature_sound
 
         message = xml_utils.escape(personal_message)
         pm = '<Data>'\
                 '<PSM>%s</PSM>'\
                 '<CurrentMedia>%s</CurrentMedia>'\
-                '<MachineGuid>{CAFEBABE-DEAD-BEEF-BAAD-FEEDDEADC0DE}</MachineGuid>'\
-            '</Data>' % (message, cm)
+                '<MachineGuid>%s</MachineGuid>'\
+            '</Data>' % (message, cm, self._client.machine_guid.upper())
         self._send_command('UUX', payload=pm)
         self._client.profile._server_property_changed("personal-message",
                 personal_message)
         if current_media is not None:
             self._client.profile._server_property_changed("current-media",
                 current_media)
+
+    @throttled(2000, LastElementQueue())
+    def set_end_point_name(self, name="Papyon", idle=False):
+        ep = '<EndpointData>'\
+                '<Capabilities>%s</Capabilities>'\
+            '</EndpointData>' % self._client.profile.client_id
+
+        name = xml_utils.escape(name)
+        pep = '<PrivateEndpointData>'\
+                '<EpName>%s</EpName>'\
+                '<Idle>%s</Idle>'\
+                '<State>%s</State>'\
+                '<ClientType>%i</ClientType>'\
+            '</PrivateEndpointData>' % (name, str(idle).lower(),
+                    self._client.profile.presence, self._client.client_type)
+        self._send_command('UUX', payload=ep)
+        self._send_command('UUX', payload=pep)
 
     def signoff(self):
         """Logout from the server"""
@@ -244,6 +270,9 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                     (domain, user, membership, network_id)
             self._send_command("RML", payload=payload)
 
+    def send_user_notification(self, message, contact, type):
+        self._send_command("UUN", (contact.account, type), message)
+
     def send_unmanaged_message(self, contact, message):
         content_type = message.content_type[0]
         if content_type == 'text/x-msnmsgr-datacast':
@@ -260,6 +289,18 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         tr_id = self._send_command('URL', url_command_args)
         self._url_callbacks[tr_id] = callback
 
+    def _parse_account(self, command, idx=0):
+        if self._protocol_version >= 18:
+            temp = command.arguments[idx].split(":")
+            network_id = int(temp[0])
+            account = temp[1]
+        else:
+            account = command.arguments[idx]
+            idx += 1
+            network_id = int(command.arguments[idx])
+        idx += 1
+        return idx, network_id, account
+
 
     # Handlers ---------------------------------------------------------------
     # --------- Connection ---------------------------------------------------
@@ -269,10 +310,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                 ProtocolConstant.CVR + (self._client.profile.account,))
 
     def _handle_CVR(self, command):
-        if self._protocol_version >= 15:
-            method = 'SSO'
-        else:
-            method = 'TWN'
+        method = 'SSO'
         self._send_command('USR',
                 (method, 'I', self._client.profile.account))
 
@@ -315,7 +353,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                     (self._sso_cb, command.arguments[3]),
                     (lambda *args: self.emit("authentication-failed"),),
                     SSO.LiveService.MESSENGER_CLEAR)
-                
+
                 self._client.address_book.connect("notify::state",
                     self._address_book_state_changed_cb)
 
@@ -376,8 +414,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         self._handle_NLN(command)
 
     def _handle_FLN(self,command):
-        network_id = int(command.arguments[1])
-        account = command.arguments[0]
+        idx, network_id, account = self._parse_account(command)
 
         contacts = self._client.address_book.contacts.\
                 search_by_network_id(network_id).\
@@ -392,33 +429,39 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                     profile.Presence.OFFLINE)
 
     def _handle_NLN(self,command):
-        network_id = int(command.arguments[2])
-        account = command.arguments[1]
+        idx, network_id, account = self._parse_account(command, 1)
 
         contacts = self._client.address_book.contacts.\
                 search_by_network_id(network_id).\
                 search_by_account(account)
-        
+
         if len(contacts) == 0:
             logger.warning("Contact (network_id=%d) %s not found" % \
                     (network_id, account))
+
+        presence = command.arguments[0]
+        display_name = urllib.unquote(command.arguments[idx])
+        idx += 1
+        capabilities = command.arguments[idx]
+        idx += 1
+
+        msn_object = None
+        icon_url = None
+        if len(command.arguments) > idx:
+            if command.arguments[idx] != '0':
+                msn_object = papyon.p2p.MSNObject.parse(self._client,
+                               urllib.unquote(command.arguments[idx]))
+        idx += 1
+        if len(command.arguments) > idx:
+            icon_url = command.arguments[idx]
+
         for contact in contacts:
-            presence = command.arguments[0]
-            display_name = urllib.unquote(command.arguments[3])
-            capabilities = int(command.arguments[4])
             contact._server_property_changed("presence", presence)
             contact._server_property_changed("display-name", display_name)
             contact._server_property_changed("client-capabilities", capabilities)
-            if len(command.arguments) >= 6:
-                if command.arguments[5] != '0':
-                    msn_object = papyon.p2p.MSNObject.parse(self._client,
-                                   urllib.unquote(command.arguments[5]))
-                    contact._server_property_changed("msn-object", msn_object)
-                elif command.arguments[5] == '0':
-                    contact._server_property_changed("msn-object", None)
-                elif len(command.arguments) > 6:
-                    icon_url = command.arguments[6]
-                    contact._server_attribute_changed('icon_url', icon_url)
+            contact._server_property_changed("msn-object", msn_object)
+            if icon_url is not None:
+                contact._server_attribute_changed('icon_url', icon_url)
 
     # --------- Display name and co ------------------------------------------
     def _handle_PRP(self, command):
@@ -435,14 +478,42 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
     def _handle_UBN(self,command): # contact infos
         if not command.payload:
             return
-        print "RECEIVED UBN : %s\n%s" % (unicode(command), repr(command.payload))
-        
+        type = int(command.arguments[1])
+        self.emit("buddy-notification-received", type, command)
+
     def _handle_UBX(self,command): # contact infos
         if not command.payload:
             return
-        
-        network_id = int(command.arguments[1])
-        account = command.arguments[0] 
+
+        idx, network_id, account = self._parse_account(command)
+
+        try:
+            tree = ElementTree.fromstring(command.payload)
+        except:
+            logger.error("Invalid XML data in received UBX command")
+            return
+
+        cm = tree.find("./CurrentMedia")
+        if cm is not None and cm.text is not None:
+            parts = cm.text.split('\\0')
+            if parts[1] == 'Music' and parts[2] == '1':
+                cm = (parts[4].encode("utf-8"), parts[5].encode("utf-8"))
+            elif parts[2] == '0':
+                cm = None
+        else:
+            cm = None
+
+        pm = tree.find("./PSM")
+        if pm is not None and pm.text is not None:
+            pm = pm.text.encode("utf-8")
+        else:
+            pm = ""
+
+        ss = tree.find("./SignatureSound")
+        if ss is not None and ss.text is not None:
+            ss = ss.text.encode("utf-8")
+        else:
+            ss = None
 
         contacts = self._client.address_book.contacts.\
                 search_by_network_id(network_id).\
@@ -451,24 +522,15 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         if len(contacts) == 0:
             logger.warning("Contact (network_id=%d) %s not found" % \
                     (network_id, account))
+
         for contact in contacts:
-            cm = ElementTree.fromstring(command.payload).find("./CurrentMedia")
-            if cm is not None and cm.text is not None:
-                parts = cm.text.split('\\0')
-                if parts[1] == 'Music' and parts[2] == '1':
-                    cm = (parts[4].encode("utf-8"), parts[5].encode("utf-8"))
-                    contact._server_property_changed("current-media", cm)
-                    continue
-                elif parts[2] == '0':
-                    contact._server_property_changed("current-media", None)
-            else:
-                contact._server_property_changed("current-media", None)
-            pm = ElementTree.fromstring(command.payload).find("./PSM")
-            if pm is not None and pm.text is not None:
-                pm = pm.text.encode("utf-8")
-            else:
-                pm = ""
+            contact._server_property_changed("current-media", cm)
             contact._server_property_changed("personal-message", pm)
+            contact._server_property_changed("signature-sound", ss)
+
+    def _handle_UUN(self,command): # UBN acknowledgment
+        pass
+
     # --------- Contact List -------------------------------------------------
     def _handle_ADL(self, command):
         if command.transaction_id == 0: # incoming ADL from the server
@@ -488,17 +550,19 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         message = Message(None, command.payload)
         content_type = message.content_type
         if content_type[0] == 'text/x-msmsgsprofile':
-            self._client.profile._server_property_changed("profile",
-                    command.payload)
+            profile = {}
+            lines = command.payload.split("\r\n")
+            for line in lines:
+                line = line.strip()
+                if line:
+                    name, value = line.split(":", 1)
+                    profile[name] = value.strip()
+            self._client.profile._server_property_changed("profile", profile)
 
-            if self._protocol_version < 15:
-                #self._send_command('SYN', ('0', '0'))
-                raise NotImplementedError, "Missing Implementation, please fix"
-            else:
-                self._send_command("BLP",
-                        (self._client.profile.privacy,))
-                self._state = ProtocolState.SYNCHRONIZING
-                self._client.address_book.sync()
+            self._send_command("BLP",
+                    (self._client.profile.privacy,))
+            self._state = ProtocolState.SYNCHRONIZING
+            self._client.address_book.sync()
         elif content_type[0] in \
                 ('text/x-msmsgsinitialmdatanotification', \
                  'text/x-msmsgsoimnotification'):
@@ -519,7 +583,6 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                     if start < end:
                         mailbox_unread = int(mail_data[start:end])
                         self._client.mailbox._initial_set(mailbox_unread)
-                        
         elif content_type[0] == 'text/x-msmsgsinitialemailnotification':
             #Initial mail (obsolete by MSNP11)
             pass
@@ -551,10 +614,9 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                 self._client.mailbox._unread_mail_decreased(delta)
             elif dest == 'ACTIVE':
                 self._client.mailbox._unread_mail_increased(delta)
-    
+
     def _handle_UBM(self, command):
-        network_id = int(command.arguments[1])
-        account = command.arguments[0]
+        idx, network_id, account = self._parse_account(command)
 
         contacts = self._client.address_book.contacts.\
                 search_by_network_id(network_id).\
@@ -569,29 +631,22 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
             self.emit("unmanaged-message-received", contact, message)
 
     # --------- Urls ---------------------------------------------------------
-    
-    def _build_url_post_data(self, 
-                message_url="/cgi-bin/HoTMaiL", 
+
+    def _build_url_post_data(self,
+                message_url="/cgi-bin/HoTMaiL",
                 post_url='https://loginnet.passport.com/ppsecure/md5auth.srf?',
                 post_id='2'):
-        
-        profile = {}
-        lines = self._client.profile.profile.split("\r\n")
-        for line in lines:
-            line = line.strip()
-            if line:
-                name, value = line.split(":", 1)
-                profile[name] = value.strip()
-                
+
+        profile = self._client.profile.profile
         account = self._client.profile.account
         password = str(self._client.profile.password)
         sl = str(int(time.time()) - int(profile['LoginTime']))
         sid = profile['sid']
         auth = profile['MSPAuth']
         creds = hashlib.md5(auth + sl + password).hexdigest()
-        
+
         post_data = dict([
-            ('mode', 'ttl'),            
+            ('mode', 'ttl'),
             ('login', account.split('@')[0]),
             ('username', account),
             ('sid', sid),
@@ -609,7 +664,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
         tr_id = command.transaction_id
         if tr_id in self._url_callbacks:
             message_url, post_url, post_id = command.arguments
-            post_url, form_dict = self._build_url_post_data(message_url, 
+            post_url, form_dict = self._build_url_post_data(message_url,
                                                             post_url, post_id)
             callback = self._url_callbacks[tr_id]
             del self._url_callbacks[tr_id]
@@ -644,7 +699,11 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
     def _connect_cb(self, transport):
         self.__switchboard_callbacks = PriorityQueue()
         self._state = ProtocolState.OPENING
-        self._send_command('VER', ProtocolConstant.VER)
+        versions = []
+        for version in ProtocolConstant.VER:
+            if version <= self._protocol_version:
+                versions.append("MSNP%i" % version)
+        self._send_command('VER', versions)
 
     def _disconnect_cb(self, transport, reason):
         self._state = ProtocolState.CLOSED
@@ -654,10 +713,15 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
             return
 
         clear_token = tokens[SSO.LiveService.MESSENGER_CLEAR]
+        token = clear_token.security_token
         blob = clear_token.mbi_crypt(nonce)
+        if self._protocol_version >= 16:
+            arguments = ("SSO", "S", token, blob, "{%s}" %
+                    self._client.machine_guid.upper())
+        else:
+            arguments = ("SSO", "S", token, blob)
 
-        self._send_command("USR",
-                ("SSO", "S", clear_token.security_token, blob))
+        self._send_command("USR", arguments)
 
     def _address_book_state_changed_cb(self, address_book, pspec):
         MAX_PAYLOAD_SIZE = 7500
@@ -685,7 +749,7 @@ class NotificationProtocol(BaseProtocol, gobject.GObject):
                 if size >= MAX_PAYLOAD_SIZE:
                     payloads[-1] += '</d></ml>'
                     payloads.append('<ml l="1"><d n="%s">' % domain)
-                payloads[-1] += node 
+                payloads[-1] += node
             payloads[-1] += '</d>'
         payloads[-1] += '</ml>'
 
